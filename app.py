@@ -10,7 +10,7 @@ import os
 import time
 import psutil
 import gc
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from playwright.async_api import async_playwright
 import nest_asyncio
 import uvicorn
@@ -170,7 +170,7 @@ async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, cust
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=True,   # Railway par headless hi rakho
+                headless=True,
                 args=[
                     '--no-sandbox',
                     '--disable-dev-shm-usage',
@@ -212,10 +212,10 @@ async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, cust
             
             print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Navigating to Zoom...")
             await page.goto(zoom_url, timeout=60000)
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)  # Reduced for speed
 
             # ============================================
-            # NAME INPUT (With name_type support)
+            # NAME INPUT
             # ============================================
             try:
                 user_name = get_name(name_type, custom_names, index)
@@ -230,7 +230,7 @@ async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, cust
                     try:
                         name_input = page.locator(f'xpath={selector}')
                         if await name_input.count() > 0:
-                            await name_input.first.wait_for(state="visible", timeout=3000)
+                            await name_input.first.wait_for(state="visible", timeout=2000)
                             await name_input.first.fill(user_name)
                             name_filled = True
                             print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Name entered: {user_name}")
@@ -250,7 +250,7 @@ async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, cust
             # ============================================
             if passcode and passcode != "" and passcode != "0":
                 try:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
                     passcode_xpath = '/html/body/div[2]/div[1]/div/div[1]/div/div[2]/div[2]/div/input'
                     pass_input = page.locator(f'xpath={passcode_xpath}')
                     if await pass_input.count() > 0:
@@ -265,7 +265,7 @@ async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, cust
             await wait_for_all_bots()
 
             # ============================================
-            # JOIN BUTTON - EXACTLY AS WORKING SCRIPT
+            # JOIN BUTTON
             # ============================================
             try:
                 join_xpath = '/html/body/div[2]/div[1]/div/div[1]/div/div[2]/button'
@@ -281,9 +281,9 @@ async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, cust
                 await page.keyboard.press('Enter')
 
             # ============================================
-            # AUDIO JOIN (AS PER WORKING SCRIPT)
+            # AUDIO JOIN
             # ============================================
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             try:
                 audio_btn = page.locator('xpath=//button[contains(text(), "Join Audio")]')
                 if await audio_btn.count() > 0:
@@ -402,7 +402,7 @@ async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, nam
             start_optimized(tag, duration_seconds, meeting_code, passcode, name_type, custom_names, i)
         )
         tasks.append(task)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.3)  # 0.3 sec gap for fast start
     
     await asyncio.gather(*tasks)
     
