@@ -1,6 +1,4 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-pydantic==2.5.0from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -465,8 +463,3 @@ async def health():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
-python-multipart==0.0.6
-playwright==1.40.0
-nest-asyncio==1.5.8
-faker==24.4.0
-psutil==5.9.8
