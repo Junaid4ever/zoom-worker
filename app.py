@@ -1,22 +1,21 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import threading
 import asyncio
-import os
-import random
+import sys
 import base64
-import gc
-import signal
+import random
+import os
+import time
 import psutil
+import gc
 from datetime import datetime
 from playwright.async_api import async_playwright
 import nest_asyncio
 import uvicorn
 from typing import List, Optional
-from pathlib import Path
-from faker import Faker
+import signal
 
 nest_asyncio.apply()
 
@@ -32,30 +31,37 @@ app.add_middleware(
 )
 
 # ============================================
-# SCREENSHOT DIRECTORY
+# NAME GENERATORS (Indian + English + Custom)
 # ============================================
-SCREENSHOT_DIR = Path("screenshots")
-SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+INDIAN_FIRST_NAMES = [
+    'Aarav', 'Vivaan', 'Aditya', 'Vihaan', 'Arjun', 'Reyansh', 'Ayaan', 'Krishna', 'Ishaan', 'Shaurya',
+    'Rahul', 'Rohan', 'Priya', 'Ananya', 'Diya', 'Saanvi', 'Aadhya', 'Kavya', 'Riya', 'Anika',
+    'Amit', 'Rajesh', 'Sneha', 'Pooja', 'Neha', 'Vikram', 'Karan', 'Manish', 'Suresh', 'Deepak'
+]
+INDIAN_LAST_NAMES = [
+    'Sharma', 'Verma', 'Patel', 'Kumar', 'Singh', 'Reddy', 'Gupta', 'Joshi',
+    'Malhotra', 'Mehta', 'Chopra', 'Khanna', 'Agarwal', 'Jain', 'Saxena',
+    'Bansal', 'Srivastava', 'Mishra', 'Pandey', 'Rao', 'Desai', 'Nair'
+]
 
-# ============================================
-# ULTRA-FAST NAME GENERATORS
-# ============================================
-
-fake_indian = Faker('en_IN')
-fake_english = Faker('en_US')
-
-INDIAN_NAME_POOL = []
-ENGLISH_NAME_POOL = []
-
-for _ in range(2000):
-    INDIAN_NAME_POOL.append(fake_indian.name())
-    ENGLISH_NAME_POOL.append(fake_english.name())
+ENGLISH_FIRST_NAMES = [
+    'James', 'John', 'Robert', 'Michael', 'William', 'David', 'Richard', 'Joseph',
+    'Thomas', 'Charles', 'Christopher', 'Daniel', 'Matthew', 'Anthony', 'Donald',
+    'Mark', 'Paul', 'Steven', 'Andrew', 'Kenneth', 'Joshua', 'Kevin', 'Brian',
+    'George', 'Timothy', 'Ronald', 'Edward', 'Jason', 'Jeffrey', 'Ryan', 'Jacob'
+]
+ENGLISH_LAST_NAMES = [
+    'Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis',
+    'Rodriguez', 'Martinez', 'Hernandez', 'Lopez', 'Wilson', 'Anderson', 'Thomas',
+    'Taylor', 'Moore', 'Jackson', 'Martin', 'Lee', 'Perez', 'Thompson', 'White',
+    'Harris', 'Sanchez', 'Clark', 'Ramirez', 'Lewis', 'Robinson', 'Walker', 'Young'
+]
 
 def get_indian_name():
-    return random.choice(INDIAN_NAME_POOL)
+    return f"{random.choice(INDIAN_FIRST_NAMES)} {random.choice(INDIAN_LAST_NAMES)}"
 
 def get_english_name():
-    return random.choice(ENGLISH_NAME_POOL)
+    return f"{random.choice(ENGLISH_FIRST_NAMES)} {random.choice(ENGLISH_LAST_NAMES)}"
 
 def get_name(name_type, custom_names=None, index=0):
     if name_type == "custom" and custom_names and index < len(custom_names):
@@ -77,7 +83,7 @@ def get_zoom_url(meeting_code):
     return f"https://{ZOOM_PARTS['domain']}/{ZOOM_PARTS['join_path']}/{meeting_code}"
 
 # ============================================
-# REQUEST MODELS
+# REQUEST MODEL
 # ============================================
 class StartBotRequest(BaseModel):
     meeting_code: str
@@ -91,15 +97,7 @@ class StopBotRequest(BaseModel):
     meeting_code: str
 
 # ============================================
-# STATE
-# ============================================
-active_browsers = {}  # tag -> browser object
-active_browser_pids = {}  # tag -> pid
-active_meetings = {}
-billing_enabled = True
-
-# ============================================
-# SYNC BARRIER
+# SYNC BARRIER (Exactly as working script)
 # ============================================
 READY_TO_JOIN = asyncio.Event()
 BOTS_READY = 0
@@ -124,71 +122,55 @@ async def wait_for_all_bots():
     await READY_TO_JOIN.wait()
 
 # ============================================
-# INSTANT KILL - Force Kill Browser Process
+# STATE (for kill)
+# ============================================
+active_browsers = {}
+active_meetings = {}
+billing_enabled = True
+
+# ============================================
+# KILL FUNCTION (Using psutil)
 # ============================================
 def kill_all_browser_processes(meeting_code):
-    """Kill all Chromium processes associated with this meeting using psutil"""
     killed = 0
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
             cmdline = ' '.join(proc.info['cmdline'] or [])
             if 'chromium' in cmdline.lower() or 'chrome' in cmdline.lower():
-                if meeting_code in cmdline or any(tag.startswith(meeting_code) for tag in active_browser_pids.keys()):
+                if meeting_code in cmdline:
                     proc.kill()
                     killed += 1
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except:
             pass
     return killed
 
 async def kill_meeting_browsers(meeting_code):
-    """Kill all browsers for a meeting instantly"""
     killed = 0
-    tags_to_remove = []
-    
-    # First, try graceful close via playwright
-    for tag, browser in list(active_browsers.items()):
+    tags = list(active_browsers.keys())
+    for tag in tags:
         if tag.startswith(meeting_code):
             try:
-                await browser.close()
+                await active_browsers[tag].close()
                 killed += 1
-                tags_to_remove.append(tag)
             except:
-                # If graceful fails, we'll kill via psutil later
                 pass
-    
-    # Remove tags that were closed gracefully
-    for tag in tags_to_remove:
-        if tag in active_browsers:
             del active_browsers[tag]
-        if tag in active_browser_pids:
-            del active_browser_pids[tag]
-    
-    # Force kill any remaining processes using psutil
+    # Force kill via psutil
     killed += kill_all_browser_processes(meeting_code)
-    
-    # Clean up any remaining tags
-    for tag in list(active_browser_pids.keys()):
-        if tag.startswith(meeting_code):
-            del active_browser_pids[tag]
-    for tag in list(active_browsers.keys()):
-        if tag.startswith(meeting_code):
-            del active_browsers[tag]
-    
     return killed
 
 # ============================================
-# BOT FUNCTION - WITH DETAILED LOGS
+# BOT FUNCTION (EXACTLY YOUR WORKING SCRIPT)
 # ============================================
-async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_names, index):
+async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, custom_names, index):
     global BOTS_FAILED
-    
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Started")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Started")
     gc.collect()
 
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=True,
+                headless=True,   # Railway par headless hi rakho
                 args=[
                     '--no-sandbox',
                     '--disable-dev-shm-usage',
@@ -207,35 +189,34 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
                     '--use-fake-device-for-media-stream',
                     '--use-file-for-fake-audio-capture=/dev/null',
                     '--window-size=800,600',
-                    '--max_old_space_size=64',
-                    '--js-flags=--max-old-space-size=64',
+                    '--max_old_space_size=256',
+                    '--js-flags=--max-old-space-size=256',
                     '--disable-site-isolation-trials',
                     '--disable-web-security',
                     '--disable-features=IsolateOrigins,site-per-process',
                     '--disk-cache-size=0',
-                    '--media-cache-size=0',
-                    '--single-process'
+                    '--media-cache-size=0'
                 ]
             )
 
             active_browsers[tag] = browser
-            if hasattr(browser, 'process') and browser.process:
-                active_browser_pids[tag] = browser.process.pid
 
             context = await browser.new_context(
                 viewport={"width": 800, "height": 600},
                 permissions=[],
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
 
             page = await context.new_page()
             zoom_url = get_zoom_url(meetingcode)
             
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Navigating to Zoom...")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Navigating to Zoom...")
             await page.goto(zoom_url, timeout=60000)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2)
 
-            # NAME INPUT
+            # ============================================
+            # NAME INPUT (With name_type support)
+            # ============================================
             try:
                 user_name = get_name(name_type, custom_names, index)
                 name_selectors = [
@@ -249,81 +230,86 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
                     try:
                         name_input = page.locator(f'xpath={selector}')
                         if await name_input.count() > 0:
-                            await name_input.first.wait_for(state="visible", timeout=2000)
+                            await name_input.first.wait_for(state="visible", timeout=3000)
                             await name_input.first.fill(user_name)
                             name_filled = True
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Name entered: {user_name}")
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Name entered: {user_name}")
                             break
                     except:
                         continue
                 
                 if not name_filled:
                     await page.keyboard.type(user_name)
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Name typed: {user_name}")
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Name typed: {user_name}")
                     
             except Exception as e:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Name error: {e}")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Name error: {e}")
 
+            # ============================================
             # PASSCODE INPUT
-            if passcode is not None and passcode != "":
+            # ============================================
+            if passcode and passcode != "" and passcode != "0":
                 try:
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
                     passcode_xpath = '/html/body/div[2]/div[1]/div/div[1]/div/div[2]/div[2]/div/input'
                     pass_input = page.locator(f'xpath={passcode_xpath}')
                     if await pass_input.count() > 0:
                         await pass_input.fill(passcode)
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Passcode entered")
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Passcode entered")
                 except Exception as e:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Passcode error: {e}")
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Passcode error: {e}")
 
+            # ============================================
             # WAIT FOR ALL BOTS
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Waiting for all bots...")
+            # ============================================
             await wait_for_all_bots()
 
-            # JOIN BUTTON
+            # ============================================
+            # JOIN BUTTON - EXACTLY AS WORKING SCRIPT
+            # ============================================
             try:
                 join_xpath = '/html/body/div[2]/div[1]/div/div[1]/div/div[2]/button'
                 join_btn = page.locator(f'xpath={join_xpath}')
                 if await join_btn.count() > 0:
                     await join_btn.click()
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Join clicked")
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Join clicked")
                 else:
                     await page.keyboard.press('Enter')
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Enter pressed for join")
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Enter pressed for join")
             except Exception as e:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Join error: {e}")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Join error: {e}")
                 await page.keyboard.press('Enter')
 
+            # ============================================
+            # AUDIO JOIN (AS PER WORKING SCRIPT)
+            # ============================================
             await asyncio.sleep(2)
-            
-            # Audio join
             try:
                 audio_btn = page.locator('xpath=//button[contains(text(), "Join Audio")]')
                 if await audio_btn.count() > 0:
                     await audio_btn.click()
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Audio joined")
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Audio joined")
             except Exception as e:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Audio error: {e}")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Audio error: {e}")
 
-            await asyncio.sleep(1)
+            # ============================================
+            # STAY IN MEETING
+            # ============================================
+            # Check if in meeting (optional)
             try:
+                await asyncio.sleep(1)
                 leave_btn = page.locator('xpath=//button[contains(text(), "Leave")]')
                 if await leave_btn.count() > 0:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - CONFIRMED: In meeting!")
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ CONFIRMED: In meeting!")
                 else:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Warning: Not confirmed in meeting")
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ⚠️ Not confirmed in meeting")
             except:
                 pass
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - ✅ Joined! Staying for {wait_time//60} minutes")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ Joined! Staying for {wait_time//60} minutes")
             
-            # STAY IN MEETING
             elapsed = 0
             while elapsed < wait_time:
-                if not billing_enabled:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Billing disabled, stopping...")
-                    break
-                    
                 await asyncio.sleep(10)
                 elapsed += 10
                 
@@ -332,10 +318,10 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
                     try:
                         await page.evaluate("() => 'ping'")
                     except:
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Ping failed")
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Ping failed")
                         break
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Done")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ Done")
             
             await page.close()
             await context.close()
@@ -344,16 +330,12 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
             
             if tag in active_browsers:
                 del active_browsers[tag]
-            if tag in active_browser_pids:
-                del active_browser_pids[tag]
             
     except Exception as e:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} - Failed: {str(e)[:100]}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ❌ Failed: {str(e)[:100]}")
         BOTS_FAILED += 1
         if tag in active_browsers:
             del active_browsers[tag]
-        if tag in active_browser_pids:
-            del active_browser_pids[tag]
 
 # ============================================
 # API ENDPOINTS
@@ -417,7 +399,7 @@ async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, nam
     for i in range(bot_count):
         tag = f"{meeting_code}-Bot-{i+1}"
         task = asyncio.create_task(
-            start_bot(tag, duration_seconds, meeting_code, passcode, name_type, custom_names, i)
+            start_optimized(tag, duration_seconds, meeting_code, passcode, name_type, custom_names, i)
         )
         tasks.append(task)
         await asyncio.sleep(0.3)
@@ -430,15 +412,11 @@ async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, nam
 
 @app.post("/api/stop-bots")
 async def stop_bots(request: StopBotRequest):
-    """Kill all bots for a meeting instantly"""
     meeting_code = request.meeting_code
-    
     killed = await kill_meeting_browsers(meeting_code)
-    
     if meeting_code in active_meetings:
         active_meetings[meeting_code]["status"] = "killed"
         active_meetings[meeting_code]["killed_at"] = datetime.now().isoformat()
-    
     return {
         "success": True,
         "message": f"Instantly killed {killed} bots for meeting {meeting_code}",
