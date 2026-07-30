@@ -10,12 +10,13 @@ import os
 import time
 import psutil
 import gc
+import signal
 from datetime import datetime, timezone, timedelta
 from playwright.async_api import async_playwright
 import nest_asyncio
 import uvicorn
 from typing import List, Optional
-import signal
+import redis.asyncio as redis
 
 nest_asyncio.apply()
 
@@ -29,6 +30,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============================================
+# REDIS CONFIG (Get from environment)
+# ============================================
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_client = None
+pubsub = None
 
 # ============================================
 # NAME GENERATORS (Indian + English + Custom)
@@ -97,7 +105,14 @@ class StopBotRequest(BaseModel):
     meeting_code: str
 
 # ============================================
-# SYNC BARRIER (Exactly as working script)
+# STATE (local)
+# ============================================
+active_browsers = {}  # tag -> browser
+active_meetings = {}
+billing_enabled = True
+
+# ============================================
+# SYNC BARRIER
 # ============================================
 READY_TO_JOIN = asyncio.Event()
 BOTS_READY = 0
@@ -122,14 +137,7 @@ async def wait_for_all_bots():
     await READY_TO_JOIN.wait()
 
 # ============================================
-# STATE (for kill)
-# ============================================
-active_browsers = {}
-active_meetings = {}
-billing_enabled = True
-
-# ============================================
-# KILL FUNCTION (Using psutil)
+# KILL HELPERS
 # ============================================
 def kill_all_browser_processes(meeting_code):
     killed = 0
@@ -144,7 +152,8 @@ def kill_all_browser_processes(meeting_code):
             pass
     return killed
 
-async def kill_meeting_browsers(meeting_code):
+async def kill_meeting_browsers_local(meeting_code):
+    """Kill local browsers for this meeting on this replica"""
     killed = 0
     tags = list(active_browsers.keys())
     for tag in tags:
@@ -155,14 +164,42 @@ async def kill_meeting_browsers(meeting_code):
             except:
                 pass
             del active_browsers[tag]
-    # Force kill via psutil
     killed += kill_all_browser_processes(meeting_code)
+    if meeting_code in active_meetings:
+        active_meetings[meeting_code]["status"] = "killed"
     return killed
 
 # ============================================
-# BOT FUNCTION (EXACTLY YOUR WORKING SCRIPT)
+# REDIS SUBSCRIBER (runs in background)
 # ============================================
-async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, custom_names, index):
+async def redis_listener():
+    global pubsub
+    if not redis_client:
+        return
+    pubsub = redis_client.pubsub()
+    await pubsub.subscribe("zoom_kill_channel")
+    print("📡 Redis subscriber started. Listening for kill commands...")
+    while True:
+        try:
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+            if message:
+                data = message.get('data')
+                if data:
+                    meeting_code = data.decode()
+                    print(f"📢 Received kill command for meeting: {meeting_code}")
+                    # Kill local bots for this meeting
+                    killed = await kill_meeting_browsers_local(meeting_code)
+                    print(f"✅ Killed {killed} bots on this replica for meeting {meeting_code}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Redis listener error: {e}")
+            await asyncio.sleep(1)
+
+# ============================================
+# BOT FUNCTION
+# ============================================
+async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_names, index):
     global BOTS_FAILED
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Started")
     gc.collect()
@@ -212,11 +249,9 @@ async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, cust
             
             print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Navigating to Zoom...")
             await page.goto(zoom_url, timeout=60000)
-            await asyncio.sleep(1)  # Reduced for speed
+            await asyncio.sleep(1)
 
-            # ============================================
             # NAME INPUT
-            # ============================================
             try:
                 user_name = get_name(name_type, custom_names, index)
                 name_selectors = [
@@ -245,9 +280,7 @@ async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, cust
             except Exception as e:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Name error: {e}")
 
-            # ============================================
             # PASSCODE INPUT
-            # ============================================
             if passcode and passcode != "" and passcode != "0":
                 try:
                     await asyncio.sleep(0.3)
@@ -259,14 +292,10 @@ async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, cust
                 except Exception as e:
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Passcode error: {e}")
 
-            # ============================================
             # WAIT FOR ALL BOTS
-            # ============================================
             await wait_for_all_bots()
 
-            # ============================================
             # JOIN BUTTON
-            # ============================================
             try:
                 join_xpath = '/html/body/div[2]/div[1]/div/div[1]/div/div[2]/button'
                 join_btn = page.locator(f'xpath={join_xpath}')
@@ -280,10 +309,9 @@ async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, cust
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Join error: {e}")
                 await page.keyboard.press('Enter')
 
-            # ============================================
-            # AUDIO JOIN
-            # ============================================
             await asyncio.sleep(1)
+            
+            # Audio join
             try:
                 audio_btn = page.locator('xpath=//button[contains(text(), "Join Audio")]')
                 if await audio_btn.count() > 0:
@@ -292,12 +320,8 @@ async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, cust
             except Exception as e:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Audio error: {e}")
 
-            # ============================================
-            # STAY IN MEETING
-            # ============================================
-            # Check if in meeting (optional)
+            await asyncio.sleep(1)
             try:
-                await asyncio.sleep(1)
                 leave_btn = page.locator('xpath=//button[contains(text(), "Leave")]')
                 if await leave_btn.count() > 0:
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ CONFIRMED: In meeting!")
@@ -340,6 +364,15 @@ async def start_optimized(tag, wait_time, meetingcode, passcode, name_type, cust
 # ============================================
 # API ENDPOINTS
 # ============================================
+@app.on_event("startup")
+async def startup_event():
+    global redis_client
+    # Connect to Redis
+    redis_client = await redis.from_url(REDIS_URL, decode_responses=True)
+    # Start background listener
+    asyncio.create_task(redis_listener())
+    print("✅ Worker started with Redis Pub/Sub support.")
+
 @app.get("/")
 async def root():
     return {"message": "Zoom Bot Worker is running!", "status": "healthy"}
@@ -399,10 +432,10 @@ async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, nam
     for i in range(bot_count):
         tag = f"{meeting_code}-Bot-{i+1}"
         task = asyncio.create_task(
-            start_optimized(tag, duration_seconds, meeting_code, passcode, name_type, custom_names, i)
+            start_bot(tag, duration_seconds, meeting_code, passcode, name_type, custom_names, i)
         )
         tasks.append(task)
-        await asyncio.sleep(0.3)  # 0.3 sec gap for fast start
+        await asyncio.sleep(0.3)
     
     await asyncio.gather(*tasks)
     
@@ -412,15 +445,30 @@ async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, nam
 
 @app.post("/api/stop-bots")
 async def stop_bots(request: StopBotRequest):
+    """Kill bots on THIS replica AND broadcast kill to all replicas via Redis"""
     meeting_code = request.meeting_code
-    killed = await kill_meeting_browsers(meeting_code)
+    
+    # 1. Kill local bots on this replica
+    killed_local = await kill_meeting_browsers_local(meeting_code)
+    
+    # 2. Broadcast kill command to all replicas via Redis
+    if redis_client:
+        await redis_client.publish("zoom_kill_channel", meeting_code)
+        print(f"📢 Published kill command for {meeting_code} to Redis channel")
+    
+    # 3. Also kill via psutil on this replica (just in case)
+    killed_extra = kill_all_browser_processes(meeting_code)
+    killed_total = killed_local + killed_extra
+    
     if meeting_code in active_meetings:
         active_meetings[meeting_code]["status"] = "killed"
         active_meetings[meeting_code]["killed_at"] = datetime.now().isoformat()
+    
     return {
         "success": True,
-        "message": f"Instantly killed {killed} bots for meeting {meeting_code}",
-        "bots_killed": killed
+        "message": f"Killed {killed_total} bots locally and broadcast kill to all replicas.",
+        "bots_killed_local": killed_total,
+        "broadcast": True
     }
 
 @app.get("/api/status")
