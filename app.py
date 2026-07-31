@@ -11,12 +11,11 @@ import time
 import psutil
 import gc
 import signal
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from playwright.async_api import async_playwright
 import nest_asyncio
 import uvicorn
 from typing import List, Optional
-import redis.asyncio as redis
 
 nest_asyncio.apply()
 
@@ -32,14 +31,7 @@ app.add_middleware(
 )
 
 # ============================================
-# REDIS CONFIG (Get from environment)
-# ============================================
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-redis_client = None
-pubsub = None
-
-# ============================================
-# NAME GENERATORS (Indian + English + Custom)
+# NAME GENERATORS
 # ============================================
 INDIAN_FIRST_NAMES = [
     'Aarav', 'Vivaan', 'Aditya', 'Vihaan', 'Arjun', 'Reyansh', 'Ayaan', 'Krishna', 'Ishaan', 'Shaurya',
@@ -91,7 +83,7 @@ def get_zoom_url(meeting_code):
     return f"https://{ZOOM_PARTS['domain']}/{ZOOM_PARTS['join_path']}/{meeting_code}"
 
 # ============================================
-# REQUEST MODEL
+# REQUEST MODELS
 # ============================================
 class StartBotRequest(BaseModel):
     meeting_code: str
@@ -137,23 +129,23 @@ async def wait_for_all_bots():
     await READY_TO_JOIN.wait()
 
 # ============================================
-# KILL HELPERS
+# KILL FUNCTION — Force Kill Using psutil
 # ============================================
 def kill_all_browser_processes(meeting_code):
+    """Kill all Chromium processes that contain meeting_code in command line"""
     killed = 0
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
             cmdline = ' '.join(proc.info['cmdline'] or [])
-            if 'chromium' in cmdline.lower() or 'chrome' in cmdline.lower():
-                if meeting_code in cmdline:
-                    proc.kill()
-                    killed += 1
+            if ('chromium' in cmdline.lower() or 'chrome' in cmdline.lower()) and meeting_code in cmdline:
+                proc.kill()
+                killed += 1
         except:
             pass
     return killed
 
 async def kill_meeting_browsers_local(meeting_code):
-    """Kill local browsers for this meeting on this replica"""
+    """Kill browsers for this meeting on this replica"""
     killed = 0
     tags = list(active_browsers.keys())
     for tag in tags:
@@ -164,37 +156,9 @@ async def kill_meeting_browsers_local(meeting_code):
             except:
                 pass
             del active_browsers[tag]
+    # Force kill via psutil
     killed += kill_all_browser_processes(meeting_code)
-    if meeting_code in active_meetings:
-        active_meetings[meeting_code]["status"] = "killed"
     return killed
-
-# ============================================
-# REDIS SUBSCRIBER (runs in background)
-# ============================================
-async def redis_listener():
-    global pubsub
-    if not redis_client:
-        return
-    pubsub = redis_client.pubsub()
-    await pubsub.subscribe("zoom_kill_channel")
-    print("📡 Redis subscriber started. Listening for kill commands...")
-    while True:
-        try:
-            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            if message:
-                data = message.get('data')
-                if data:
-                    meeting_code = data.decode()
-                    print(f"📢 Received kill command for meeting: {meeting_code}")
-                    # Kill local bots for this meeting
-                    killed = await kill_meeting_browsers_local(meeting_code)
-                    print(f"✅ Killed {killed} bots on this replica for meeting {meeting_code}")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"Redis listener error: {e}")
-            await asyncio.sleep(1)
 
 # ============================================
 # BOT FUNCTION
@@ -364,15 +328,6 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
 # ============================================
 # API ENDPOINTS
 # ============================================
-@app.on_event("startup")
-async def startup_event():
-    global redis_client
-    # Connect to Redis
-    redis_client = await redis.from_url(REDIS_URL, decode_responses=True)
-    # Start background listener
-    asyncio.create_task(redis_listener())
-    print("✅ Worker started with Redis Pub/Sub support.")
-
 @app.get("/")
 async def root():
     return {"message": "Zoom Bot Worker is running!", "status": "healthy"}
@@ -443,32 +398,19 @@ async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, nam
         active_meetings[meeting_code]["status"] = "completed"
         active_meetings[meeting_code]["completed_at"] = datetime.now().isoformat()
 
+# ============================================
+# STOP ENDPOINT — Reliable Kill
+# ============================================
 @app.post("/api/stop-bots")
 async def stop_bots(request: StopBotRequest):
-    """Kill bots on THIS replica AND broadcast kill to all replicas via Redis"""
     meeting_code = request.meeting_code
-    
-    # 1. Kill local bots on this replica
-    killed_local = await kill_meeting_browsers_local(meeting_code)
-    
-    # 2. Broadcast kill command to all replicas via Redis
-    if redis_client:
-        await redis_client.publish("zoom_kill_channel", meeting_code)
-        print(f"📢 Published kill command for {meeting_code} to Redis channel")
-    
-    # 3. Also kill via psutil on this replica (just in case)
-    killed_extra = kill_all_browser_processes(meeting_code)
-    killed_total = killed_local + killed_extra
-    
+    killed = await kill_meeting_browsers_local(meeting_code)
     if meeting_code in active_meetings:
         active_meetings[meeting_code]["status"] = "killed"
-        active_meetings[meeting_code]["killed_at"] = datetime.now().isoformat()
-    
     return {
         "success": True,
-        "message": f"Killed {killed_total} bots locally and broadcast kill to all replicas.",
-        "bots_killed_local": killed_total,
-        "broadcast": True
+        "message": f"Killed {killed} bots.",
+        "bots_killed_local": killed
     }
 
 @app.get("/api/status")
