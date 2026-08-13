@@ -106,7 +106,7 @@ shared_browser = None
 browser_lock = asyncio.Lock()
 
 # ============================================
-# SYNC BARRIER (GLOBALS — FIXED)
+# SYNC BARRIER
 # ============================================
 READY_TO_JOIN = asyncio.Event()
 BOTS_READY = 0
@@ -153,7 +153,7 @@ async def get_shared_browser(playwright):
         return shared_browser
 
 # ============================================
-# WAIT FOR ALL BOTS (USES GLOBAL SYNC VARIABLES)
+# WAIT FOR ALL BOTS
 # ============================================
 async def wait_for_all_bots(meeting_code):
     global BOTS_READY, BOTS_TOTAL, BOTS_FAILED
@@ -201,7 +201,7 @@ async def kill_meeting_browsers_local(meeting_code):
     return killed
 
 # ============================================
-# BOT FUNCTION
+# BOT FUNCTION — STABLE KEEP-ALIVE (NO PING)
 # ============================================
 async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_names, index, playwright):
     global BOTS_FAILED
@@ -266,7 +266,7 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
             except Exception as e:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Passcode error: {e}")
 
-        # WAIT FOR ALL BOTS (USES GLOBAL SYNC)
+        # WAIT FOR ALL BOTS
         await wait_for_all_bots(meetingcode)
 
         # JOIN BUTTON
@@ -304,21 +304,11 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
         except:
             pass
 
+        # ============================================
+        # STAY IN MEETING — SIMPLIFIED (NO PING)
+        # ============================================
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ Joined! Staying for {wait_time//60} minutes")
-        
-        elapsed = 0
-        while elapsed < wait_time:
-            await asyncio.sleep(10)
-            elapsed += 10
-            
-            if elapsed % 60 == 0:
-                gc.collect()
-                try:
-                    await page.evaluate("() => 'ping'")
-                except:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Ping failed")
-                    break
-
+        await asyncio.sleep(wait_time)   # <--- NO PING, JUST WAIT
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ Done")
         
         await page.close()
