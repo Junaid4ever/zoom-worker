@@ -1,16 +1,13 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import threading
 import asyncio
 import sys
 import base64
 import random
 import os
-import time
 import psutil
 import gc
-import signal
 from datetime import datetime
 from playwright.async_api import async_playwright
 import nest_asyncio
@@ -99,14 +96,14 @@ class StopBotRequest(BaseModel):
 # ============================================
 # STATE
 # ============================================
-active_contexts = {}  # tag -> context
+active_contexts = {}
 active_meetings = {}
 billing_enabled = True
 shared_browser = None
 browser_lock = asyncio.Lock()
 
 # ============================================
-# SYNC BARRIER
+# SYNC BARRIER (SAME EVENT LOOP)
 # ============================================
 READY_TO_JOIN = asyncio.Event()
 BOTS_READY = 0
@@ -155,7 +152,7 @@ async def get_shared_browser(playwright):
 # ============================================
 # WAIT FOR ALL BOTS
 # ============================================
-async def wait_for_all_bots(meeting_code):
+async def wait_for_all_bots():
     global BOTS_READY, BOTS_TOTAL, BOTS_FAILED
     async with BOTS_LOCK:
         BOTS_READY += 1
@@ -201,7 +198,7 @@ async def kill_meeting_browsers_local(meeting_code):
     return killed
 
 # ============================================
-# BOT FUNCTION — STABLE KEEP-ALIVE (NO PING)
+# BOT FUNCTION
 # ============================================
 async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_names, index, playwright):
     global BOTS_FAILED
@@ -267,7 +264,7 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Passcode error: {e}")
 
         # WAIT FOR ALL BOTS
-        await wait_for_all_bots(meetingcode)
+        await wait_for_all_bots()
 
         # JOIN BUTTON
         try:
@@ -304,11 +301,8 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
         except:
             pass
 
-        # ============================================
-        # STAY IN MEETING — SIMPLIFIED (NO PING)
-        # ============================================
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ Joined! Staying for {wait_time//60} minutes")
-        await asyncio.sleep(wait_time)   # <--- NO PING, JUST WAIT
+        await asyncio.sleep(wait_time)
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ Done")
         
         await page.close()
@@ -325,65 +319,53 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
             del active_contexts[tag]
 
 # ============================================
-# API ENDPOINTS
+# API ENDPOINTS — USING BACKGROUNDTASKS (NO THREADING)
 # ============================================
 @app.get("/")
 async def root():
     return {"message": "Zoom Bot Worker is running!", "status": "healthy"}
 
 @app.post("/api/start-bots")
-async def start_bots(request: StartBotRequest):
+async def start_bots(request: StartBotRequest, background_tasks: BackgroundTasks):
     global BOTS_TOTAL, BOTS_READY, BOTS_FAILED, billing_enabled
     
     if not billing_enabled:
         raise HTTPException(status_code=403, detail="Billing is disabled")
     
-    try:
-        if request.bot_count < 1 or request.bot_count > 50:
-            raise HTTPException(status_code=400, detail="Bot count must be between 1 and 50")
-        
-        BOTS_TOTAL = request.bot_count
-        BOTS_READY = 0
-        BOTS_FAILED = 0
-        READY_TO_JOIN.clear()
-        
-        if request.meeting_code not in active_meetings:
-            active_meetings[request.meeting_code] = {
-                "start_time": datetime.now(),
-                "bots": request.bot_count,
-                "duration": request.duration_minutes,
-                "status": "running"
-            }
-        else:
-            active_meetings[request.meeting_code]["status"] = "running"
-        
-        def run_bots():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(run_bot_tasks(
-                    request.meeting_code, 
-                    request.passcode, 
-                    request.bot_count, 
-                    request.duration_minutes,
-                    request.name_type,
-                    request.custom_names
-                ))
-            finally:
-                loop.close()
-        
-        thread = threading.Thread(target=run_bots)
-        thread.daemon = True
-        thread.start()
-        
-        return {
-            "success": True,
-            "message": f"Started {request.bot_count} bots for meeting {request.meeting_code}",
-            "duration": request.duration_minutes
+    if request.bot_count < 1 or request.bot_count > 50:
+        raise HTTPException(status_code=400, detail="Bot count must be between 1 and 50")
+    
+    BOTS_TOTAL = request.bot_count
+    BOTS_READY = 0
+    BOTS_FAILED = 0
+    READY_TO_JOIN.clear()
+    
+    if request.meeting_code not in active_meetings:
+        active_meetings[request.meeting_code] = {
+            "start_time": datetime.now(),
+            "bots": request.bot_count,
+            "duration": request.duration_minutes,
+            "status": "running"
         }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    else:
+        active_meetings[request.meeting_code]["status"] = "running"
+    
+    # Run bots in background without threading — using FastAPI's BackgroundTasks
+    background_tasks.add_task(
+        run_bot_tasks,
+        request.meeting_code,
+        request.passcode,
+        request.bot_count,
+        request.duration_minutes,
+        request.name_type,
+        request.custom_names
+    )
+    
+    return {
+        "success": True,
+        "message": f"Started {request.bot_count} bots for meeting {request.meeting_code}",
+        "duration": request.duration_minutes
+    }
 
 async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, name_type, custom_names):
     duration_seconds = duration_minutes * 60
@@ -408,9 +390,6 @@ async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, nam
         active_meetings[meeting_code]["status"] = "completed"
         active_meetings[meeting_code]["completed_at"] = datetime.now().isoformat()
 
-# ============================================
-# STOP ENDPOINT
-# ============================================
 @app.post("/api/stop-bots")
 async def stop_bots(request: StopBotRequest):
     meeting_code = request.meeting_code
