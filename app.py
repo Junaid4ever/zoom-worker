@@ -17,6 +17,7 @@ import nest_asyncio
 import uvicorn
 from typing import List, Optional
 
+# Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
 
 app = FastAPI()
@@ -106,26 +107,52 @@ shared_browser = None
 browser_lock = asyncio.Lock()
 
 # ============================================
-# SHARED BROWSER (Memory optimization)
+# GLOBAL EVENT LOOP REFERENCE (FIX FOR THREADING)
 # ============================================
-async def get_shared_browser():
+main_loop = None
+
+# ============================================
+# SHARED BROWSER
+# ============================================
+async def get_shared_browser(playwright):
     global shared_browser
     async with browser_lock:
         if shared_browser is None:
-            # We need playwright instance; we'll create inside start_bot
-            pass
+            shared_browser = await playwright.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-software-rasterizer',
+                    '--disable-extensions',
+                    '--disable-background-timer-throttling',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding',
+                    '--disable-features=PermissionPrompt',
+                    '--disable-notifications',
+                    '--disable-popup-blocking',
+                    '--disable-camera',
+                    '--disable-video-capture',
+                    '--mute-audio',
+                    '--use-fake-device-for-media-stream',
+                    '--use-file-for-fake-audio-capture=/dev/null',
+                    '--window-size=800,600',
+                    '--max_old_space_size=256',
+                    '--js-flags=--max-old-space-size=256',
+                    '--disable-site-isolation-trials',
+                    '--disable-web-security',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--disk-cache-size=0',
+                    '--media-cache-size=0'
+                ]
+            )
         return shared_browser
 
 # ============================================
-# SYNC BARRIER
+# SYNC BARRIER (FIXED FOR MULTIPLE BOTS)
 # ============================================
-READY_TO_JOIN = asyncio.Event()
-BOTS_READY = 0
-BOTS_TOTAL = 0
-BOTS_FAILED = 0
-BOTS_LOCK = asyncio.Lock()
-
-async def wait_for_all_bots():
+async def wait_for_all_bots(meeting_code):
     global BOTS_READY, BOTS_TOTAL, BOTS_FAILED
     async with BOTS_LOCK:
         BOTS_READY += 1
@@ -167,12 +194,11 @@ async def kill_meeting_browsers_local(meeting_code):
             except:
                 pass
             del active_contexts[tag]
-    # Also kill any browser processes
     killed += kill_all_browser_processes(meeting_code)
     return killed
 
 # ============================================
-# BOT FUNCTION (uses shared browser context)
+# BOT FUNCTION
 # ============================================
 async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_names, index, playwright):
     global BOTS_FAILED
@@ -180,42 +206,11 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
     gc.collect()
 
     try:
-        # Get or create shared browser (same for all bots)
-        global shared_browser
-        async with browser_lock:
-            if shared_browser is None:
-                shared_browser = await playwright.chromium.launch(
-                    headless=True,
-                    args=[
-                        '--no-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--disable-gpu',
-                        '--disable-software-rasterizer',
-                        '--disable-extensions',
-                        '--disable-background-timer-throttling',
-                        '--disable-backgrounding-occluded-windows',
-                        '--disable-renderer-backgrounding',
-                        '--disable-features=PermissionPrompt',
-                        '--disable-notifications',
-                        '--disable-popup-blocking',
-                        '--disable-camera',
-                        '--disable-video-capture',
-                        '--mute-audio',
-                        '--use-fake-device-for-media-stream',
-                        '--use-file-for-fake-audio-capture=/dev/null',
-                        '--window-size=800,600',
-                        '--max_old_space_size=256',
-                        '--js-flags=--max-old-space-size=256',
-                        '--disable-site-isolation-trials',
-                        '--disable-web-security',
-                        '--disable-features=IsolateOrigins,site-per-process',
-                        '--disk-cache-size=0',
-                        '--media-cache-size=0'
-                    ]
-                )
+        # Get shared browser
+        browser = await get_shared_browser(playwright)
 
-        # Create a new context (isolated session) for this bot
-        context = await shared_browser.new_context(
+        # Create isolated context
+        context = await browser.new_context(
             viewport={"width": 800, "height": 600},
             permissions=[],
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -271,7 +266,7 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Passcode error: {e}")
 
         # WAIT FOR ALL BOTS
-        await wait_for_all_bots()
+        await wait_for_all_bots(meetingcode)
 
         # JOIN BUTTON
         try:
@@ -347,7 +342,7 @@ async def root():
 
 @app.post("/api/start-bots")
 async def start_bots(request: StartBotRequest):
-    global BOTS_TOTAL, BOTS_READY, BOTS_FAILED, billing_enabled
+    global BOTS_TOTAL, BOTS_READY, BOTS_FAILED, billing_enabled, main_loop
     
     if not billing_enabled:
         raise HTTPException(status_code=403, detail="Billing is disabled")
@@ -371,15 +366,24 @@ async def start_bots(request: StartBotRequest):
         else:
             active_meetings[request.meeting_code]["status"] = "running"
         
+        # Store the current event loop for the thread
+        main_loop = asyncio.get_running_loop()
+        
         def run_bots():
-            asyncio.run(run_bot_tasks(
-                request.meeting_code, 
-                request.passcode, 
-                request.bot_count, 
-                request.duration_minutes,
-                request.name_type,
-                request.custom_names
-            ))
+            # Create new event loop for this thread
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                new_loop.run_until_complete(run_bot_tasks(
+                    request.meeting_code, 
+                    request.passcode, 
+                    request.bot_count, 
+                    request.duration_minutes,
+                    request.name_type,
+                    request.custom_names
+                ))
+            finally:
+                new_loop.close()
         
         thread = threading.Thread(target=run_bots)
         thread.daemon = True
@@ -396,9 +400,7 @@ async def start_bots(request: StartBotRequest):
 
 async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, name_type, custom_names):
     duration_seconds = duration_minutes * 60
-    # Use a single playwright instance for all bots
     async with async_playwright() as p:
-        # This p will be passed to all tasks
         tasks = []
         for i in range(bot_count):
             tag = f"{meeting_code}-Bot-{i+1}"
@@ -406,11 +408,11 @@ async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, nam
                 start_bot(tag, duration_seconds, meeting_code, passcode, name_type, custom_names, i, p)
             )
             tasks.append(task)
-            await asyncio.sleep(0.2)  # small delay to avoid CPU spike
+            await asyncio.sleep(0.15)  # 150ms gap for CPU spike control
         
         await asyncio.gather(*tasks)
         
-        # Close shared browser after all bots done
+        # Close shared browser after all done
         global shared_browser
         if shared_browser:
             await shared_browser.close()
@@ -421,7 +423,7 @@ async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, nam
         active_meetings[meeting_code]["completed_at"] = datetime.now().isoformat()
 
 # ============================================
-# STOP ENDPOINT — Kill all contexts
+# STOP ENDPOINT
 # ============================================
 @app.post("/api/stop-bots")
 async def stop_bots(request: StopBotRequest):
@@ -429,7 +431,7 @@ async def stop_bots(request: StopBotRequest):
     killed = await kill_meeting_browsers_local(meeting_code)
     if meeting_code in active_meetings:
         active_meetings[meeting_code]["status"] = "killed"
-    # Also kill shared browser if exists
+    # Also close shared browser
     global shared_browser
     if shared_browser:
         await shared_browser.close()
