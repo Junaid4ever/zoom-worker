@@ -17,7 +17,6 @@ import nest_asyncio
 import uvicorn
 from typing import List, Optional
 
-# Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
 
 app = FastAPI()
@@ -107,9 +106,13 @@ shared_browser = None
 browser_lock = asyncio.Lock()
 
 # ============================================
-# GLOBAL EVENT LOOP REFERENCE (FIX FOR THREADING)
+# SYNC BARRIER (GLOBALS — FIXED)
 # ============================================
-main_loop = None
+READY_TO_JOIN = asyncio.Event()
+BOTS_READY = 0
+BOTS_TOTAL = 0
+BOTS_FAILED = 0
+BOTS_LOCK = asyncio.Lock()
 
 # ============================================
 # SHARED BROWSER
@@ -150,7 +153,7 @@ async def get_shared_browser(playwright):
         return shared_browser
 
 # ============================================
-# SYNC BARRIER (FIXED FOR MULTIPLE BOTS)
+# WAIT FOR ALL BOTS (USES GLOBAL SYNC VARIABLES)
 # ============================================
 async def wait_for_all_bots(meeting_code):
     global BOTS_READY, BOTS_TOTAL, BOTS_FAILED
@@ -206,10 +209,8 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
     gc.collect()
 
     try:
-        # Get shared browser
         browser = await get_shared_browser(playwright)
 
-        # Create isolated context
         context = await browser.new_context(
             viewport={"width": 800, "height": 600},
             permissions=[],
@@ -265,7 +266,7 @@ async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_nam
             except Exception as e:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Passcode error: {e}")
 
-        # WAIT FOR ALL BOTS
+        # WAIT FOR ALL BOTS (USES GLOBAL SYNC)
         await wait_for_all_bots(meetingcode)
 
         # JOIN BUTTON
@@ -342,7 +343,7 @@ async def root():
 
 @app.post("/api/start-bots")
 async def start_bots(request: StartBotRequest):
-    global BOTS_TOTAL, BOTS_READY, BOTS_FAILED, billing_enabled, main_loop
+    global BOTS_TOTAL, BOTS_READY, BOTS_FAILED, billing_enabled
     
     if not billing_enabled:
         raise HTTPException(status_code=403, detail="Billing is disabled")
@@ -366,15 +367,11 @@ async def start_bots(request: StartBotRequest):
         else:
             active_meetings[request.meeting_code]["status"] = "running"
         
-        # Store the current event loop for the thread
-        main_loop = asyncio.get_running_loop()
-        
         def run_bots():
-            # Create new event loop for this thread
-            new_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(new_loop)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             try:
-                new_loop.run_until_complete(run_bot_tasks(
+                loop.run_until_complete(run_bot_tasks(
                     request.meeting_code, 
                     request.passcode, 
                     request.bot_count, 
@@ -383,7 +380,7 @@ async def start_bots(request: StartBotRequest):
                     request.custom_names
                 ))
             finally:
-                new_loop.close()
+                loop.close()
         
         thread = threading.Thread(target=run_bots)
         thread.daemon = True
@@ -408,11 +405,10 @@ async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, nam
                 start_bot(tag, duration_seconds, meeting_code, passcode, name_type, custom_names, i, p)
             )
             tasks.append(task)
-            await asyncio.sleep(0.15)  # 150ms gap for CPU spike control
+            await asyncio.sleep(0.15)
         
         await asyncio.gather(*tasks)
         
-        # Close shared browser after all done
         global shared_browser
         if shared_browser:
             await shared_browser.close()
@@ -431,7 +427,6 @@ async def stop_bots(request: StopBotRequest):
     killed = await kill_meeting_browsers_local(meeting_code)
     if meeting_code in active_meetings:
         active_meetings[meeting_code]["status"] = "killed"
-    # Also close shared browser
     global shared_browser
     if shared_browser:
         await shared_browser.close()
