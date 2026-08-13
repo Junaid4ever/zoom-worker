@@ -88,7 +88,7 @@ def get_zoom_url(meeting_code):
 class StartBotRequest(BaseModel):
     meeting_code: str
     passcode: str = ""
-    bot_count: int = 5
+    bot_count: int = 50
     duration_minutes: int = 60
     name_type: str = "indian"
     custom_names: Optional[List[str]] = None
@@ -97,11 +97,24 @@ class StopBotRequest(BaseModel):
     meeting_code: str
 
 # ============================================
-# STATE (local)
+# STATE
 # ============================================
-active_browsers = {}  # tag -> browser
+active_contexts = {}  # tag -> context
 active_meetings = {}
 billing_enabled = True
+shared_browser = None
+browser_lock = asyncio.Lock()
+
+# ============================================
+# SHARED BROWSER (Memory optimization)
+# ============================================
+async def get_shared_browser():
+    global shared_browser
+    async with browser_lock:
+        if shared_browser is None:
+            # We need playwright instance; we'll create inside start_bot
+            pass
+        return shared_browser
 
 # ============================================
 # SYNC BARRIER
@@ -129,10 +142,9 @@ async def wait_for_all_bots():
     await READY_TO_JOIN.wait()
 
 # ============================================
-# KILL FUNCTION — Force Kill Using psutil
+# KILL FUNCTION
 # ============================================
 def kill_all_browser_processes(meeting_code):
-    """Kill all Chromium processes that contain meeting_code in command line"""
     killed = 0
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
@@ -145,185 +157,186 @@ def kill_all_browser_processes(meeting_code):
     return killed
 
 async def kill_meeting_browsers_local(meeting_code):
-    """Kill browsers for this meeting on this replica"""
     killed = 0
-    tags = list(active_browsers.keys())
+    tags = list(active_contexts.keys())
     for tag in tags:
         if tag.startswith(meeting_code):
             try:
-                await active_browsers[tag].close()
+                await active_contexts[tag].close()
                 killed += 1
             except:
                 pass
-            del active_browsers[tag]
-    # Force kill via psutil
+            del active_contexts[tag]
+    # Also kill any browser processes
     killed += kill_all_browser_processes(meeting_code)
     return killed
 
 # ============================================
-# BOT FUNCTION
+# BOT FUNCTION (uses shared browser context)
 # ============================================
-async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_names, index):
+async def start_bot(tag, wait_time, meetingcode, passcode, name_type, custom_names, index, playwright):
     global BOTS_FAILED
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Started")
     gc.collect()
 
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--disable-software-rasterizer',
-                    '--disable-extensions',
-                    '--disable-background-timer-throttling',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--disable-features=PermissionPrompt',
-                    '--disable-notifications',
-                    '--disable-popup-blocking',
-                    '--disable-camera',
-                    '--disable-video-capture',
-                    '--mute-audio',
-                    '--use-fake-device-for-media-stream',
-                    '--use-file-for-fake-audio-capture=/dev/null',
-                    '--window-size=800,600',
-                    '--max_old_space_size=256',
-                    '--js-flags=--max-old-space-size=256',
-                    '--disable-site-isolation-trials',
-                    '--disable-web-security',
-                    '--disable-features=IsolateOrigins,site-per-process',
-                    '--disk-cache-size=0',
-                    '--media-cache-size=0'
-                ]
-            )
+        # Get or create shared browser (same for all bots)
+        global shared_browser
+        async with browser_lock:
+            if shared_browser is None:
+                shared_browser = await playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--disable-software-rasterizer',
+                        '--disable-extensions',
+                        '--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-features=PermissionPrompt',
+                        '--disable-notifications',
+                        '--disable-popup-blocking',
+                        '--disable-camera',
+                        '--disable-video-capture',
+                        '--mute-audio',
+                        '--use-fake-device-for-media-stream',
+                        '--use-file-for-fake-audio-capture=/dev/null',
+                        '--window-size=800,600',
+                        '--max_old_space_size=256',
+                        '--js-flags=--max-old-space-size=256',
+                        '--disable-site-isolation-trials',
+                        '--disable-web-security',
+                        '--disable-features=IsolateOrigins,site-per-process',
+                        '--disk-cache-size=0',
+                        '--media-cache-size=0'
+                    ]
+                )
 
-            active_browsers[tag] = browser
+        # Create a new context (isolated session) for this bot
+        context = await shared_browser.new_context(
+            viewport={"width": 800, "height": 600},
+            permissions=[],
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        active_contexts[tag] = context
 
-            context = await browser.new_context(
-                viewport={"width": 800, "height": 600},
-                permissions=[],
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
+        page = await context.new_page()
+        zoom_url = get_zoom_url(meetingcode)
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Navigating to Zoom...")
+        await page.goto(zoom_url, timeout=60000)
+        await asyncio.sleep(1)
 
-            page = await context.new_page()
-            zoom_url = get_zoom_url(meetingcode)
+        # NAME INPUT
+        try:
+            user_name = get_name(name_type, custom_names, index)
+            name_selectors = [
+                '//*[@id="input-for-name"]',
+                '//input[@placeholder="Enter your name"]',
+                '//input[@name="name"]'
+            ]
             
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Navigating to Zoom...")
-            await page.goto(zoom_url, timeout=60000)
-            await asyncio.sleep(1)
-
-            # NAME INPUT
-            try:
-                user_name = get_name(name_type, custom_names, index)
-                name_selectors = [
-                    '//*[@id="input-for-name"]',
-                    '//input[@placeholder="Enter your name"]',
-                    '//input[@name="name"]'
-                ]
-                
-                name_filled = False
-                for selector in name_selectors:
-                    try:
-                        name_input = page.locator(f'xpath={selector}')
-                        if await name_input.count() > 0:
-                            await name_input.first.wait_for(state="visible", timeout=2000)
-                            await name_input.first.fill(user_name)
-                            name_filled = True
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Name entered: {user_name}")
-                            break
-                    except:
-                        continue
-                
-                if not name_filled:
-                    await page.keyboard.type(user_name)
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Name typed: {user_name}")
-                    
-            except Exception as e:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Name error: {e}")
-
-            # PASSCODE INPUT
-            if passcode and passcode != "" and passcode != "0":
+            name_filled = False
+            for selector in name_selectors:
                 try:
-                    await asyncio.sleep(0.3)
-                    passcode_xpath = '/html/body/div[2]/div[1]/div/div[1]/div/div[2]/div[2]/div/input'
-                    pass_input = page.locator(f'xpath={passcode_xpath}')
-                    if await pass_input.count() > 0:
-                        await pass_input.fill(passcode)
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Passcode entered")
-                except Exception as e:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Passcode error: {e}")
-
-            # WAIT FOR ALL BOTS
-            await wait_for_all_bots()
-
-            # JOIN BUTTON
-            try:
-                join_xpath = '/html/body/div[2]/div[1]/div/div[1]/div/div[2]/button'
-                join_btn = page.locator(f'xpath={join_xpath}')
-                if await join_btn.count() > 0:
-                    await join_btn.click()
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Join clicked")
-                else:
-                    await page.keyboard.press('Enter')
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Enter pressed for join")
-            except Exception as e:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Join error: {e}")
-                await page.keyboard.press('Enter')
-
-            await asyncio.sleep(1)
-            
-            # Audio join
-            try:
-                audio_btn = page.locator('xpath=//button[contains(text(), "Join Audio")]')
-                if await audio_btn.count() > 0:
-                    await audio_btn.click()
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Audio joined")
-            except Exception as e:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Audio error: {e}")
-
-            await asyncio.sleep(1)
-            try:
-                leave_btn = page.locator('xpath=//button[contains(text(), "Leave")]')
-                if await leave_btn.count() > 0:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ CONFIRMED: In meeting!")
-                else:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ⚠️ Not confirmed in meeting")
-            except:
-                pass
-
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ Joined! Staying for {wait_time//60} minutes")
-            
-            elapsed = 0
-            while elapsed < wait_time:
-                await asyncio.sleep(10)
-                elapsed += 10
-                
-                if elapsed % 60 == 0:
-                    gc.collect()
-                    try:
-                        await page.evaluate("() => 'ping'")
-                    except:
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Ping failed")
+                    name_input = page.locator(f'xpath={selector}')
+                    if await name_input.count() > 0:
+                        await name_input.first.wait_for(state="visible", timeout=2000)
+                        await name_input.first.fill(user_name)
+                        name_filled = True
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Name entered: {user_name}")
                         break
+                except:
+                    continue
+            
+            if not name_filled:
+                await page.keyboard.type(user_name)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Name typed: {user_name}")
+                
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Name error: {e}")
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ Done")
+        # PASSCODE INPUT
+        if passcode and passcode != "" and passcode != "0":
+            try:
+                await asyncio.sleep(0.3)
+                passcode_xpath = '/html/body/div[2]/div[1]/div/div[1]/div/div[2]/div[2]/div/input'
+                pass_input = page.locator(f'xpath={passcode_xpath}')
+                if await pass_input.count() > 0:
+                    await pass_input.fill(passcode)
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Passcode entered")
+            except Exception as e:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Passcode error: {e}")
+
+        # WAIT FOR ALL BOTS
+        await wait_for_all_bots()
+
+        # JOIN BUTTON
+        try:
+            join_xpath = '/html/body/div[2]/div[1]/div/div[1]/div/div[2]/button'
+            join_btn = page.locator(f'xpath={join_xpath}')
+            if await join_btn.count() > 0:
+                await join_btn.click()
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Join clicked")
+            else:
+                await page.keyboard.press('Enter')
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Enter pressed for join")
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Join error: {e}")
+            await page.keyboard.press('Enter')
+
+        await asyncio.sleep(1)
+        
+        # Audio join
+        try:
+            audio_btn = page.locator('xpath=//button[contains(text(), "Join Audio")]')
+            if await audio_btn.count() > 0:
+                await audio_btn.click()
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Audio joined")
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Audio error: {e}")
+
+        await asyncio.sleep(1)
+        try:
+            leave_btn = page.locator('xpath=//button[contains(text(), "Leave")]')
+            if await leave_btn.count() > 0:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ CONFIRMED: In meeting!")
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ⚠️ Not confirmed in meeting")
+        except:
+            pass
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ Joined! Staying for {wait_time//60} minutes")
+        
+        elapsed = 0
+        while elapsed < wait_time:
+            await asyncio.sleep(10)
+            elapsed += 10
             
-            await page.close()
-            await context.close()
-            await browser.close()
-            gc.collect()
-            
-            if tag in active_browsers:
-                del active_browsers[tag]
-            
+            if elapsed % 60 == 0:
+                gc.collect()
+                try:
+                    await page.evaluate("() => 'ping'")
+                except:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} Ping failed")
+                    break
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ✅ Done")
+        
+        await page.close()
+        await context.close()
+        gc.collect()
+        
+        if tag in active_contexts:
+            del active_contexts[tag]
+        
     except Exception as e:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {tag} ❌ Failed: {str(e)[:100]}")
         BOTS_FAILED += 1
-        if tag in active_browsers:
-            del active_browsers[tag]
+        if tag in active_contexts:
+            del active_contexts[tag]
 
 # ============================================
 # API ENDPOINTS
@@ -340,8 +353,8 @@ async def start_bots(request: StartBotRequest):
         raise HTTPException(status_code=403, detail="Billing is disabled")
     
     try:
-        if request.bot_count < 1 or request.bot_count > 5:
-            raise HTTPException(status_code=400, detail="Bot count must be between 1 and 5")
+        if request.bot_count < 1 or request.bot_count > 50:
+            raise HTTPException(status_code=400, detail="Bot count must be between 1 and 50")
         
         BOTS_TOTAL = request.bot_count
         BOTS_READY = 0
@@ -383,23 +396,32 @@ async def start_bots(request: StartBotRequest):
 
 async def run_bot_tasks(meeting_code, passcode, bot_count, duration_minutes, name_type, custom_names):
     duration_seconds = duration_minutes * 60
-    tasks = []
-    for i in range(bot_count):
-        tag = f"{meeting_code}-Bot-{i+1}"
-        task = asyncio.create_task(
-            start_bot(tag, duration_seconds, meeting_code, passcode, name_type, custom_names, i)
-        )
-        tasks.append(task)
-        await asyncio.sleep(0.3)
-    
-    await asyncio.gather(*tasks)
+    # Use a single playwright instance for all bots
+    async with async_playwright() as p:
+        # This p will be passed to all tasks
+        tasks = []
+        for i in range(bot_count):
+            tag = f"{meeting_code}-Bot-{i+1}"
+            task = asyncio.create_task(
+                start_bot(tag, duration_seconds, meeting_code, passcode, name_type, custom_names, i, p)
+            )
+            tasks.append(task)
+            await asyncio.sleep(0.2)  # small delay to avoid CPU spike
+        
+        await asyncio.gather(*tasks)
+        
+        # Close shared browser after all bots done
+        global shared_browser
+        if shared_browser:
+            await shared_browser.close()
+            shared_browser = None
     
     if meeting_code in active_meetings:
         active_meetings[meeting_code]["status"] = "completed"
         active_meetings[meeting_code]["completed_at"] = datetime.now().isoformat()
 
 # ============================================
-# STOP ENDPOINT — Reliable Kill
+# STOP ENDPOINT — Kill all contexts
 # ============================================
 @app.post("/api/stop-bots")
 async def stop_bots(request: StopBotRequest):
@@ -407,6 +429,11 @@ async def stop_bots(request: StopBotRequest):
     killed = await kill_meeting_browsers_local(meeting_code)
     if meeting_code in active_meetings:
         active_meetings[meeting_code]["status"] = "killed"
+    # Also kill shared browser if exists
+    global shared_browser
+    if shared_browser:
+        await shared_browser.close()
+        shared_browser = None
     return {
         "success": True,
         "message": f"Killed {killed} bots.",
@@ -418,16 +445,16 @@ async def get_status():
     return {
         "billing_enabled": billing_enabled,
         "active_meetings": active_meetings,
-        "running_bots": len(active_browsers)
+        "running_bots": len(active_contexts)
     }
 
 @app.get("/health")
 async def health():
     return {
         "online": True,
-        "capacity": 5,
+        "capacity": 50,
         "worker_id": "worker"
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
